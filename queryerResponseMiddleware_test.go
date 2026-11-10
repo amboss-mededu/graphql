@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"net/http/httptest"
 	"strings"
 	"sync"
 	"testing"
@@ -19,14 +18,10 @@ import (
 type responseMiddlewareCtxKey struct{}
 
 // respondWith returns an http.Client whose every request is answered with the given body
-func respondWith(body string) *http.Client {
-	return &http.Client{
-		Transport: roundTripFunc(func(*http.Request) *http.Response {
-			w := httptest.NewRecorder()
-			fmt.Fprint(w, body)
-			return w.Result()
-		}),
-	}
+func respondWith(t *testing.T, body string) *http.Client {
+	return testHTTPClient(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		fmt.Fprint(w, body)
+	}))
 }
 
 func TestSingleRequestQueryer_responseMiddlewares(t *testing.T) {
@@ -38,7 +33,7 @@ func TestSingleRequestQueryer_responseMiddlewares(t *testing.T) {
 		var seenCtx context.Context
 
 		queryer := NewSingleRequestQueryer("someURL")
-		queryer.WithHTTPClient(respondWith(`{ "data": { "foo": "bar" }, "extensions": { "hello": "world" } }`))
+		queryer.WithHTTPClient(respondWith(t, `{ "data": { "foo": "bar" }, "extensions": { "hello": "world" } }`))
 		queryer.WithResponseMiddlewares([]ResponseMiddleware{
 			func(ctx context.Context, response map[string]interface{}) error {
 				seen = response
@@ -68,14 +63,10 @@ func TestSingleRequestQueryer_responseMiddlewares(t *testing.T) {
 		var contentType string
 
 		queryer := NewSingleRequestQueryer("someURL")
-		queryer.WithHTTPClient(&http.Client{
-			Transport: roundTripFunc(func(req *http.Request) *http.Response {
-				contentType = req.Header.Get("Content-Type")
-				w := httptest.NewRecorder()
-				fmt.Fprint(w, `{ "data": { "upload": "ok" }, "extensions": { "hello": "world" } }`)
-				return w.Result()
-			}),
-		})
+		queryer.WithHTTPClient(testHTTPClient(t, http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+			contentType = req.Header.Get("Content-Type")
+			fmt.Fprint(w, `{ "data": { "upload": "ok" }, "extensions": { "hello": "world" } }`)
+		})))
 		queryer.WithResponseMiddlewares([]ResponseMiddleware{
 			func(ctx context.Context, response map[string]interface{}) error {
 				seen = response
@@ -101,7 +92,7 @@ func TestSingleRequestQueryer_responseMiddlewares(t *testing.T) {
 	t.Run("an error aborts the query", func(t *testing.T) {
 		t.Parallel()
 		queryer := NewSingleRequestQueryer("someURL")
-		queryer.WithHTTPClient(respondWith(`{ "data": { "foo": "bar" } }`))
+		queryer.WithHTTPClient(respondWith(t, `{ "data": { "foo": "bar" } }`))
 		queryer.WithResponseMiddlewares([]ResponseMiddleware{
 			func(context.Context, map[string]interface{}) error { return errors.New("rejected") },
 		})
@@ -120,23 +111,19 @@ func TestMultiOpQueryer_responseMiddlewares(t *testing.T) {
 
 	// every bundled query gets its own entry in the batched response, labelled by its position
 	queryer := NewMultiOpQueryer("someURL", interval, 100)
-	queryer.WithHTTPClient(&http.Client{
-		Transport: roundTripFunc(func(req *http.Request) *http.Response {
-			var ops []map[string]interface{}
-			body, _ := io.ReadAll(req.Body)
-			assert.NoError(t, json.Unmarshal(body, &ops), "the batching queryer must send a JSON array of operations")
+	queryer.WithHTTPClient(testHTTPClient(t, http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		var ops []map[string]interface{}
+		body, _ := io.ReadAll(req.Body)
+		assert.NoError(t, json.Unmarshal(body, &ops), "the batching queryer must send a JSON array of operations")
 
-			entries := make([]string, 0, len(ops))
-			for _, op := range ops {
-				// the query text names the operation, e.g. "{ a }"
-				name := strings.Trim(op["query"].(string), "{ }")
-				entries = append(entries, fmt.Sprintf(`{ "data": { "name": "%s" }, "extensions": { "for": "%s" } }`, name, name))
-			}
-			w := httptest.NewRecorder()
-			fmt.Fprint(w, "["+strings.Join(entries, ",")+"]")
-			return w.Result()
-		}),
-	})
+		entries := make([]string, 0, len(ops))
+		for _, op := range ops {
+			// the query text names the operation, e.g. "{ a }"
+			name := strings.Trim(op["query"].(string), "{ }")
+			entries = append(entries, fmt.Sprintf(`{ "data": { "name": "%s" }, "extensions": { "for": "%s" } }`, name, name))
+		}
+		fmt.Fprint(w, "["+strings.Join(entries, ",")+"]")
+	})))
 
 	// record which context saw which response
 	var mu sync.Mutex
